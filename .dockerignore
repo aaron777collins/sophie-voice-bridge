@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+.env
+.git/
+.gitignore
+*.md
+*.log
+.vscode/
+.idea/
+sophie-voice.service
