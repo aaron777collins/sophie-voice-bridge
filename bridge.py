@@ -12,6 +12,7 @@ Usage:
     # Point ElevenLabs Custom LLM to https://voice.aaroncollins.info/v1/chat/completions
 """
 
+import asyncio
 import json
 import os
 import uuid
@@ -31,6 +32,8 @@ load_dotenv()
 CLAWDBOT_GATEWAY_URL = os.getenv("CLAWDBOT_GATEWAY_URL", "http://localhost:18789")
 CLAWDBOT_GATEWAY_TOKEN = os.getenv("CLAWDBOT_GATEWAY_TOKEN", "")
 VOICE_BRIDGE_API_KEY = os.getenv("VOICE_BRIDGE_API_KEY", "")
+SOPHIE_MCP_URL = os.getenv("SOPHIE_MCP_URL", "http://localhost:8014")
+SOPHIE_MCP_SECRET = os.getenv("SOPHIE_MCP_SECRET", "")
 
 if not CLAWDBOT_GATEWAY_TOKEN:
     print("Warning: CLAWDBOT_GATEWAY_TOKEN not set - calls may fail")
@@ -208,42 +211,78 @@ async def call_haiku(messages: list, system: str, tools: list = None) -> dict:
 
 
 async def call_sophie(question: str, urgency: str = "normal") -> str:
-    """Call Sophie (Opus) via Clawdbot for complex questions requiring full capabilities."""
+    """Call Sophie via async MCP server - starts request then polls for response."""
     
-    headers = {
-        "Authorization": f"Bearer {CLAWDBOT_GATEWAY_TOKEN}",
-        "Content-Type": "application/json"
-    }
+    if not SOPHIE_MCP_SECRET:
+        return "Sophie MCP not configured - can't access full capabilities."
     
-    # Build a prompt that tells Sophie this is from a voice call
-    prompt = f"""[Voice Call Request - Urgency: {urgency}]
-
-Aaron is on a WhatsApp voice call and asked: {question}
-
-Please help with this request. Remember:
-- Your response will be spoken aloud, so keep it conversational
-- Be thorough but concise
-- If you need to check calendar, emails, or use tools, do so
-- Include key details Aaron needs to know"""
+    headers = {"Content-Type": "application/json"}
+    context = f"Voice call with Aaron - urgency: {urgency}"
     
-    payload = {
-        "model": "anthropic/claude-opus-4-5",
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 2048,
-        "stream": False
-    }
-    
-    async with httpx.AsyncClient(timeout=120.0) as client:  # Longer timeout for Opus + tools
-        response = await client.post(
-            f"{CLAWDBOT_GATEWAY_URL}/v1/chat/completions",
-            headers=headers,
-            json=payload
-        )
-        if response.status_code == 200:
-            data = response.json()
-            return data["choices"][0]["message"]["content"]
-        else:
-            return f"Sorry, I couldn't reach my full capabilities right now. Error: {response.status_code}"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Step 1: Start the async request
+            start_response = await client.post(
+                f"{SOPHIE_MCP_URL}/ask_sophie",
+                headers=headers,
+                json={
+                    "question": question,
+                    "context": context,
+                    "secret": SOPHIE_MCP_SECRET
+                }
+            )
+            
+            if start_response.status_code != 200:
+                return f"Couldn't start Sophie request: {start_response.status_code}"
+            
+            data = start_response.json()
+            request_id = data.get("request_id")
+            
+            if not request_id:
+                return "Failed to get request ID from Sophie"
+            
+            print(f"[SOPHIE] Started request {request_id}")
+        
+        # Step 2: Poll for completion (up to 90 seconds)
+        max_wait = 90
+        poll_interval = 2
+        elapsed = 0
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            while elapsed < max_wait:
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
+                
+                check_response = await client.post(
+                    f"{SOPHIE_MCP_URL}/check_sophie",
+                    headers=headers,
+                    json={
+                        "request_id": request_id,
+                        "secret": SOPHIE_MCP_SECRET
+                    }
+                )
+                
+                if check_response.status_code != 200:
+                    continue
+                
+                result = check_response.json()
+                status = result.get("status")
+                
+                if status == "complete":
+                    print(f"[SOPHIE] Request {request_id} complete in {elapsed}s")
+                    return result.get("response", "Sophie didn't return a response.")
+                elif status == "error":
+                    return result.get("response", "Sophie encountered an error.")
+                
+                # Still processing - continue polling
+                print(f"[SOPHIE] Request {request_id} still processing ({elapsed}s)")
+        
+        return "Sophie is taking too long. Try asking something simpler."
+        
+    except httpx.TimeoutException:
+        return "Connection to Sophie timed out."
+    except Exception as e:
+        return f"Error reaching Sophie: {str(e)}"
 
 
 def extract_text_content(response: dict) -> str:

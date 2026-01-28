@@ -8,6 +8,8 @@ services:
       - CLAWDBOT_GATEWAY_URL=${CLAWDBOT_GATEWAY_URL:-http://localhost:18789}
       - CLAWDBOT_GATEWAY_TOKEN=${CLAWDBOT_GATEWAY_TOKEN}
       - VOICE_BRIDGE_API_KEY=${VOICE_BRIDGE_API_KEY}
+      - SOPHIE_MCP_URL=${SOPHIE_MCP_URL:-http://localhost:8014}
+      - SOPHIE_MCP_SECRET=${SOPHIE_MCP_SECRET}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8013/health"]
       interval: 30s
