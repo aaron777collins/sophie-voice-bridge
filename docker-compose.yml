@@ -1,18 +1,12 @@
-version: '3.8'
-
 services:
   sophie-voice:
     build: .
     container_name: sophie-voice-bridge
     restart: unless-stopped
-    ports:
-      - "8013:8013"
+    network_mode: host  # Use host network to access Clawdbot on localhost
     environment:
-      # Clawdbot Gateway for LLM backend
-      - CLAWDBOT_GATEWAY_URL=${CLAWDBOT_GATEWAY_URL:-http://host.docker.internal:18789}
+      - CLAWDBOT_GATEWAY_URL=${CLAWDBOT_GATEWAY_URL:-http://localhost:18789}
       - CLAWDBOT_GATEWAY_TOKEN=${CLAWDBOT_GATEWAY_TOKEN}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8013/health"]
       interval: 30s
