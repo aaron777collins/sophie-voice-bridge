@@ -45,7 +45,7 @@ CLAWDBOT_GATEWAY_TOKEN=your-gateway-token
 
 1. **Create Agent** in ElevenLabs Agents Platform
 2. **Agent Settings → LLM → Custom LLM**
-3. **URL:** `http://your-server:8013/v1/chat/completions`
+3. **URL:** `https://voice.aaroncollins.info/v1/chat/completions`
 4. **Model:** anything (ignored)
 5. **Enable "Custom LLM extra body":** ✓
 6. **Token Limit:** 5000
