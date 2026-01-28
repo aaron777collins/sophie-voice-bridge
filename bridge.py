@@ -44,7 +44,9 @@ security = HTTPBearer(auto_error=False)
 
 async def verify_api_key(
     credentials: HTTPAuthorizationCredentials = Depends(security),
-    authorization: str = Header(None)
+    authorization: str = Header(None),
+    x_api_key: str = Header(None, alias="X-API-Key"),
+    api_key: str = Header(None, alias="api-key")
 ):
     """Verify the bearer token matches our API key."""
     if not VOICE_BRIDGE_API_KEY:
@@ -59,6 +61,18 @@ async def verify_api_key(
     # Fallback: parse Authorization header directly
     elif authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:]
+    # Try X-API-Key header (common alternative)
+    elif x_api_key:
+        token = x_api_key
+    # Try api-key header (OpenAI style)
+    elif api_key:
+        token = api_key
+    
+    # Debug logging
+    print(f"[AUTH DEBUG] Authorization: {authorization[:30] if authorization else None}...")
+    print(f"[AUTH DEBUG] X-API-Key: {x_api_key[:20] if x_api_key else None}...")
+    print(f"[AUTH DEBUG] api-key: {api_key[:20] if api_key else None}...")
+    print(f"[AUTH DEBUG] Token extracted: {token[:20] if token else None}...")
     
     if not token or token != VOICE_BRIDGE_API_KEY:
         raise HTTPException(
@@ -248,6 +262,44 @@ def extract_tool_calls(response: dict) -> list:
         return []
 
 
+async def stream_response(content: str, model: str = "claude-3-haiku-20240307"):
+    """Convert a complete response into SSE streaming format for ElevenLabs."""
+    completion_id = f"chatcmpl-{uuid.uuid4()}"
+    created = int(datetime.now().timestamp())
+    
+    # Stream the content in chunks (word by word for natural feel)
+    words = content.split(' ')
+    for i, word in enumerate(words):
+        chunk_content = word + (' ' if i < len(words) - 1 else '')
+        chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {"content": chunk_content},
+                "finish_reason": None
+            }]
+        }
+        yield f"data: {json.dumps(chunk)}\n\n"
+    
+    # Send finish chunk
+    finish_chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "stop"
+        }]
+    }
+    yield f"data: {json.dumps(finish_chunk)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
 # ============================================================================
 # MAIN ENDPOINT
 # ============================================================================
@@ -259,6 +311,12 @@ async def create_chat_completion(
     _auth: bool = Depends(verify_api_key)
 ):
     """OpenAI-compatible chat completions endpoint for ElevenLabs."""
+    
+    # Debug: log the incoming request
+    print(f"[REQUEST] stream={request.stream}, model={request.model}")
+    print(f"[REQUEST] messages={[m.role for m in request.messages]}")
+    if request.elevenlabs_extra_body:
+        print(f"[REQUEST] elevenlabs_extra_body={request.elevenlabs_extra_body}")
     
     system = HAIKU_VOICE_SYSTEM.format(
         current_time=datetime.now().strftime("%Y-%m-%d %H:%M %Z")
@@ -301,14 +359,13 @@ async def create_chat_completion(
             
             # Get Haiku's final response after seeing Sophie's answer
             final_response = await call_haiku(messages, system)
-            return final_response
+        else:
+            # No tool use - return Haiku's direct response
+            final_response = haiku_response
         
-        # No tool use - return Haiku's direct response
-        return haiku_response
-            
     except Exception as e:
         # Return error in OpenAI format
-        return {
+        final_response = {
             "id": f"chatcmpl-error-{uuid.uuid4()}",
             "object": "chat.completion",
             "created": int(datetime.now().timestamp()),
@@ -322,6 +379,20 @@ async def create_chat_completion(
                 "finish_reason": "stop"
             }]
         }
+    
+    # If streaming requested, convert to SSE format
+    if request.stream:
+        content = extract_text_content(final_response)
+        return StreamingResponse(
+            stream_response(content),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            }
+        )
+    
+    return final_response
 
 
 @app.get("/health")
