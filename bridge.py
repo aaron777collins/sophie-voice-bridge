@@ -18,8 +18,9 @@ import uuid
 from typing import Optional, List, Any
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.responses import StreamingResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import httpx
@@ -29,11 +30,44 @@ load_dotenv()
 # Config
 CLAWDBOT_GATEWAY_URL = os.getenv("CLAWDBOT_GATEWAY_URL", "http://localhost:18789")
 CLAWDBOT_GATEWAY_TOKEN = os.getenv("CLAWDBOT_GATEWAY_TOKEN", "")
+VOICE_BRIDGE_API_KEY = os.getenv("VOICE_BRIDGE_API_KEY", "")
 
 if not CLAWDBOT_GATEWAY_TOKEN:
     print("Warning: CLAWDBOT_GATEWAY_TOKEN not set - calls may fail")
 
+if not VOICE_BRIDGE_API_KEY:
+    print("⚠️  Warning: VOICE_BRIDGE_API_KEY not set - endpoint is UNPROTECTED!")
+
 app = FastAPI(title="Sophie Voice Bridge")
+security = HTTPBearer(auto_error=False)
+
+
+async def verify_api_key(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    authorization: str = Header(None)
+):
+    """Verify the bearer token matches our API key."""
+    if not VOICE_BRIDGE_API_KEY:
+        # No key configured = open endpoint (dev mode)
+        return True
+    
+    token = None
+    
+    # Try Bearer token from security scheme
+    if credentials and credentials.credentials:
+        token = credentials.credentials
+    # Fallback: parse Authorization header directly
+    elif authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:]
+    
+    if not token or token != VOICE_BRIDGE_API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+    
+    return True
 
 # ============================================================================
 # SYSTEM PROMPTS
@@ -220,7 +254,10 @@ def extract_tool_calls(response: dict) -> list:
 
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")  # ElevenLabs uses this path
-async def create_chat_completion(request: ChatCompletionRequest):
+async def create_chat_completion(
+    request: ChatCompletionRequest,
+    _auth: bool = Depends(verify_api_key)
+):
     """OpenAI-compatible chat completions endpoint for ElevenLabs."""
     
     system = HAIKU_VOICE_SYSTEM.format(

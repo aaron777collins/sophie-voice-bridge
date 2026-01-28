@@ -7,6 +7,7 @@ services:
     environment:
       - CLAWDBOT_GATEWAY_URL=${CLAWDBOT_GATEWAY_URL:-http://localhost:18789}
       - CLAWDBOT_GATEWAY_TOKEN=${CLAWDBOT_GATEWAY_TOKEN}
+      - VOICE_BRIDGE_API_KEY=${VOICE_BRIDGE_API_KEY}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8013/health"]
       interval: 30s
