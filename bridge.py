@@ -219,6 +219,7 @@ def extract_tool_calls(response: dict) -> list:
 # ============================================================================
 
 @app.post("/v1/chat/completions")
+@app.post("/chat/completions")  # ElevenLabs uses this path
 async def create_chat_completion(request: ChatCompletionRequest):
     """OpenAI-compatible chat completions endpoint for ElevenLabs."""
     

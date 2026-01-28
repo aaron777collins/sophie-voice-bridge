@@ -5,12 +5,15 @@ ElevenLabs Custom LLM server that connects to Sophie AI via Clawdbot.
 ## Architecture
 
 ```
-WhatsApp Call → ElevenLabs (STT/TTS) → This Bridge → Clawdbot → Haiku
+WhatsApp Call → ElevenLabs (STT/TTS) → Haiku (fast) ─┬─→ Direct response
+                                                      │
+                                                      └─→ ask_sophie → Sophie/Opus
+                                                                          (full capabilities)
 ```
 
-- **Haiku** handles fast, voice-optimized responses
-- **Sophie persona** baked into the system prompt
-- Voice-optimized output (short, conversational, no formatting)
+- **Haiku** handles fast voice responses (1-3 sentences)
+- **ask_sophie tool** escalates complex questions to Sophie (Opus with tools)
+- Sophie has access to calendar, email, web search, files, memory, etc.
 
 ## Quick Start (Docker)
 
@@ -35,46 +38,98 @@ curl http://localhost:8013/health
 Create `.env` file:
 
 ```env
-CLAWDBOT_GATEWAY_URL=http://host.docker.internal:18789
+CLAWDBOT_GATEWAY_URL=http://localhost:18789
 CLAWDBOT_GATEWAY_TOKEN=your-gateway-token
 ```
 
-**Note:** `host.docker.internal` routes to the host machine where Clawdbot runs.
+## API Endpoints
 
-## ElevenLabs Setup
-
-1. **Create Agent** in ElevenLabs Agents Platform
-2. **Agent Settings → LLM → Custom LLM**
-3. **URL:** `https://voice.aaroncollins.info/v1/chat/completions`
-4. **Model:** anything (ignored)
-5. **Enable "Custom LLM extra body":** ✓
-6. **Token Limit:** 5000
-
-Then connect WhatsApp via Twilio per ElevenLabs docs.
-
-## API
-
-### Endpoint
+Both routes work (ElevenLabs uses `/chat/completions`):
 
 ```
-POST /v1/chat/completions
+POST /v1/chat/completions    # OpenAI standard
+POST /chat/completions       # ElevenLabs format
+GET  /health                 # Health check
 ```
 
-OpenAI-compatible chat completions (streaming and non-streaming).
+---
 
-### Health Check
+## 🎙️ ElevenLabs Setup Guide
 
-```
-GET /health
-```
+### Step 1: Create an Agent
 
-### Test
+1. Go to [ElevenLabs Agents Platform](https://elevenlabs.io/app/agents)
+2. Click **"Create Agent"**
+3. Give it a name (e.g., "Sophie Voice")
 
-```bash
-curl -X POST http://localhost:8013/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"messages": [{"role": "user", "content": "Hey Sophie!"}], "stream": false}'
-```
+### Step 2: Configure LLM (Custom)
+
+1. In Agent settings, go to **"LLM"** section
+2. Select **"Custom LLM"**
+3. Configure:
+   - **Server URL:** `https://voice.aaroncollins.info`
+   - **Model:** `haiku` (or anything - it's ignored)
+   - **Custom LLM extra body:** ✅ Enable this
+   - **Limit token usage:** `5000` (recommended)
+
+### Step 3: Configure Voice
+
+1. Go to **"Voice"** section
+2. Choose a voice you like (the voice Sophie will speak with)
+3. Adjust stability/clarity as needed
+
+### Step 4: Connect WhatsApp (via Twilio)
+
+1. Go to **"Phone Numbers"** section
+2. Click **"Import Phone Number"**
+3. Enter your Twilio credentials:
+   - **Phone Number:** Your Twilio number with WhatsApp enabled
+   - **Twilio SID:** From Twilio console
+   - **Twilio Token:** From Twilio console
+4. **Assign the agent** to the phone number
+
+### Step 5: Test
+
+**Outbound call (you call someone):**
+1. In Phone Numbers, click the outbound call button
+2. Select your agent
+3. Enter the phone number to call
+4. Click "Send Test Call"
+
+**Inbound call (someone calls you):**
+- Call your Twilio number on WhatsApp
+- The agent will answer automatically
+
+---
+
+## How It Works
+
+1. **You speak** on WhatsApp call
+2. **ElevenLabs STT** transcribes your speech to text
+3. **Text sent** to `/chat/completions` endpoint
+4. **Haiku evaluates:**
+   - Simple question → responds directly (fast, 1-3 sentences)
+   - Complex question → uses `ask_sophie` tool
+5. **If ask_sophie used:**
+   - Sophie (Opus) processes with full tool access
+   - Can check calendar, email, search web, access files
+   - Haiku relays response conversationally
+6. **ElevenLabs TTS** converts response to speech
+7. **You hear** Sophie's voice response
+
+## When ask_sophie is Used
+
+Haiku automatically escalates to Sophie when you ask about:
+- Calendar, schedule, events, appointments
+- Emails, messages, notifications
+- Files, documents, code, projects
+- Research requiring web search or browsing
+- Complex technical or business questions
+- Anything requiring memory of past conversations
+
+Simple greetings, math, and general knowledge are handled by Haiku directly.
+
+---
 
 ## Development
 
@@ -88,21 +143,22 @@ pip install -r requirements.txt
 python bridge.py
 ```
 
-## How It Works
+## Test Commands
 
-1. ElevenLabs sends transcribed speech to `/v1/chat/completions`
-2. Bridge adds Sophie's voice persona as system prompt
-3. Request forwarded to Clawdbot's HTTP API (uses Haiku model)
-4. Response streamed back to ElevenLabs
-5. ElevenLabs converts to speech
+```bash
+# Health check
+curl https://voice.aaroncollins.info/health
 
-## Voice Persona
+# Simple question (Haiku direct)
+curl -X POST https://voice.aaroncollins.info/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "What is 2+2?"}], "stream": false}'
 
-The bridge includes a voice-optimized system prompt:
-- Keep responses SHORT (1-3 sentences)
-- Natural speech patterns, not formal prose
-- No markdown or formatting (it's audio)
-- Conversational and warm
+# Complex question (triggers ask_sophie)
+curl -X POST https://voice.aaroncollins.info/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "What meetings do I have tomorrow?"}], "stream": false}'
+```
 
 ## License
 
