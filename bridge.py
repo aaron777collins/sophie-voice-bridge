@@ -2,19 +2,19 @@
 """
 Sophie Voice Bridge - ElevenLabs Custom LLM Server
 
-Exposes an OpenAI-compatible /v1/chat/completions endpoint that:
-1. Uses Haiku (via Clawdbot) for fast voice responses
-2. Can escalate to Sophie (Opus) for complex questions via ask_sophie tool
-3. Maintains Sophie's persona throughout
+Architecture:
+- Haiku handles fast voice responses (1-3 sentences, conversational)
+- ask_sophie tool escalates to Sophie (Opus) for complex questions
+- Sophie has full access to tools, memory, calendar, email, etc.
 
 Usage:
     python bridge.py
-    # Then point ElevenLabs Custom LLM to http://localhost:8013/v1/chat/completions
+    # Point ElevenLabs Custom LLM to https://voice.aaroncollins.info/v1/chat/completions
 """
 
 import json
 import os
-import asyncio
+import uuid
 from typing import Optional, List, Any
 from datetime import datetime
 
@@ -26,7 +26,7 @@ import httpx
 
 load_dotenv()
 
-# Config - use Clawdbot gateway as the LLM backend
+# Config
 CLAWDBOT_GATEWAY_URL = os.getenv("CLAWDBOT_GATEWAY_URL", "http://localhost:18789")
 CLAWDBOT_GATEWAY_TOKEN = os.getenv("CLAWDBOT_GATEWAY_TOKEN", "")
 
@@ -35,27 +35,80 @@ if not CLAWDBOT_GATEWAY_TOKEN:
 
 app = FastAPI(title="Sophie Voice Bridge")
 
-# Sophie's voice persona - optimized for voice conversations
-SOPHIE_VOICE_SYSTEM = """You are Sophie, Aaron's AI partner. You're speaking on a voice call via WhatsApp.
+# ============================================================================
+# SYSTEM PROMPTS
+# ============================================================================
 
-Key traits:
-- Sharp, warm, capable
-- Concise and conversational (this is voice, not text!)
-- Professional when it matters, fun when it doesn't
-- You think ahead and connect dots
+HAIKU_VOICE_SYSTEM = """You are Sophie's voice interface - a fast, conversational layer that handles quick questions and small talk.
 
-Voice-specific guidelines:
-- Keep responses SHORT and conversational - you're speaking, not writing
-- Aim for 1-3 sentences max for simple questions
-- Use natural speech patterns, not formal prose
-- Don't use markdown, bullet points, or formatting - it's audio
-- Don't say "um" or "uh" but do use natural filler like "well" or "so"
-- If something requires research or complex tasks, offer to look into it
+VOICE GUIDELINES:
+- Keep responses SHORT (1-3 sentences max)
+- Speak naturally, not formally - this is audio, not text
+- No markdown, bullet points, or formatting
+- Use natural speech: "well", "so", "yeah" are fine
+
+WHEN TO USE ask_sophie:
+You have access to the ask_sophie tool which connects to Sophie's full brain (Opus model with tools).
+Use it when Aaron asks about:
+- His calendar, schedule, or upcoming events
+- His emails or messages
+- Files, projects, or code
+- Research or complex technical questions
+- Anything requiring memory of past conversations
+- Tasks that need web search, browser, or other tools
+- Business decisions or strategic thinking
+
+For simple chat, greetings, quick math, or general knowledge - just answer directly.
+When using ask_sophie, wait for the response and relay it conversationally.
 
 Current time: {current_time}
 """
 
-# OpenAI-compatible request/response models
+# Tool definitions (Anthropic format)
+TOOLS = [
+    {
+        "name": "ask_sophie",
+        "description": """Escalate to Sophie's full capabilities (Opus model with complete tool access).
+
+USE THIS TOOL WHEN AARON ASKS ABOUT:
+- Calendar, schedule, events, appointments
+- Emails, messages, notifications  
+- Files, documents, code, projects
+- Research requiring web search or browsing
+- Complex technical or business questions
+- Anything requiring memory of past conversations
+- Tasks needing tools (browser, file access, APIs)
+
+Sophie can check his calendar, read emails, search the web, access files, and remember context from previous conversations.
+
+DO NOT USE FOR:
+- Simple greetings or small talk
+- Basic math or general knowledge
+- Questions you can confidently answer
+
+When you get Sophie's response, relay it conversationally - don't just read it verbatim.""",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "The question or request to send to Sophie. Include relevant context from the conversation."
+                },
+                "urgency": {
+                    "type": "string",
+                    "enum": ["low", "normal", "high"],
+                    "description": "How urgent is this request? High = needs immediate attention."
+                }
+            },
+            "required": ["question"]
+        }
+    }
+]
+
+# ============================================================================
+# MODELS
+# ============================================================================
+
 class Message(BaseModel):
     role: str
     content: str
@@ -69,106 +122,168 @@ class ChatCompletionRequest(BaseModel):
     user_id: Optional[str] = None
     elevenlabs_extra_body: Optional[dict] = None
 
+# ============================================================================
+# CLAWDBOT API CALLS
+# ============================================================================
 
-async def call_clawdbot(messages: list, model: str = "anthropic/claude-3-haiku-20240307", 
-                        max_tokens: int = 1024, system: str = None, stream: bool = False):
-    """Call Clawdbot's OpenAI-compatible endpoint."""
+async def call_haiku(messages: list, system: str, tools: list = None) -> dict:
+    """Call Haiku via Clawdbot for fast voice responses."""
     
     headers = {
         "Authorization": f"Bearer {CLAWDBOT_GATEWAY_TOKEN}",
         "Content-Type": "application/json"
     }
     
-    # Build the messages list with system prompt
-    api_messages = []
-    if system:
-        api_messages.append({"role": "system", "content": system})
-    api_messages.extend(messages)
+    api_messages = [{"role": "system", "content": system}] + messages
     
     payload = {
-        "model": model,
+        "model": "anthropic/claude-3-haiku-20240307",
         "messages": api_messages,
-        "max_tokens": max_tokens,
-        "stream": stream
+        "max_tokens": 1024,
+        "stream": False
     }
     
-    if stream:
-        # Return streaming response
-        async def stream_from_clawdbot():
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                async with client.stream(
-                    "POST",
-                    f"{CLAWDBOT_GATEWAY_URL}/v1/chat/completions",
-                    headers=headers,
-                    json=payload
-                ) as response:
-                    async for line in response.aiter_lines():
-                        if line.startswith("data: "):
-                            yield line + "\n\n"
-                        elif line == "data: [DONE]":
-                            yield "data: [DONE]\n\n"
-        return stream_from_clawdbot()
-    else:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                f"{CLAWDBOT_GATEWAY_URL}/v1/chat/completions",
-                headers=headers,
-                json=payload
-            )
-            if response.status_code == 200:
-                return response.json()
-            else:
-                raise HTTPException(status_code=response.status_code, 
-                                  detail=f"Clawdbot error: {response.text}")
+    if tools:
+        payload["tools"] = tools
+    
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            f"{CLAWDBOT_GATEWAY_URL}/v1/chat/completions",
+            headers=headers,
+            json=payload
+        )
+        if response.status_code == 200:
+            return response.json()
+        else:
+            raise HTTPException(status_code=response.status_code, 
+                              detail=f"Haiku error: {response.text}")
 
+
+async def call_sophie(question: str, urgency: str = "normal") -> str:
+    """Call Sophie (Opus) via Clawdbot for complex questions requiring full capabilities."""
+    
+    headers = {
+        "Authorization": f"Bearer {CLAWDBOT_GATEWAY_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    
+    # Build a prompt that tells Sophie this is from a voice call
+    prompt = f"""[Voice Call Request - Urgency: {urgency}]
+
+Aaron is on a WhatsApp voice call and asked: {question}
+
+Please help with this request. Remember:
+- Your response will be spoken aloud, so keep it conversational
+- Be thorough but concise
+- If you need to check calendar, emails, or use tools, do so
+- Include key details Aaron needs to know"""
+    
+    payload = {
+        "model": "anthropic/claude-opus-4-5",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 2048,
+        "stream": False
+    }
+    
+    async with httpx.AsyncClient(timeout=120.0) as client:  # Longer timeout for Opus + tools
+        response = await client.post(
+            f"{CLAWDBOT_GATEWAY_URL}/v1/chat/completions",
+            headers=headers,
+            json=payload
+        )
+        if response.status_code == 200:
+            data = response.json()
+            return data["choices"][0]["message"]["content"]
+        else:
+            return f"Sorry, I couldn't reach my full capabilities right now. Error: {response.status_code}"
+
+
+def extract_text_content(response: dict) -> str:
+    """Extract text content from OpenAI-style response."""
+    try:
+        return response["choices"][0]["message"]["content"]
+    except (KeyError, IndexError):
+        return ""
+
+
+def extract_tool_calls(response: dict) -> list:
+    """Extract tool calls from response if present."""
+    try:
+        return response["choices"][0]["message"].get("tool_calls", [])
+    except (KeyError, IndexError):
+        return []
+
+
+# ============================================================================
+# MAIN ENDPOINT
+# ============================================================================
 
 @app.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest):
     """OpenAI-compatible chat completions endpoint for ElevenLabs."""
     
-    # Build system prompt with current time
-    system = SOPHIE_VOICE_SYSTEM.format(
+    system = HAIKU_VOICE_SYSTEM.format(
         current_time=datetime.now().strftime("%Y-%m-%d %H:%M %Z")
     )
     
-    # Extract any system message from the request and prepend
-    for msg in request.messages:
-        if msg.role == "system":
-            system = msg.content + "\n\n" + system
-            break
-    
-    # Convert messages (skip system, already handled)
+    # Convert messages
     messages = [{"role": m.role, "content": m.content} 
                 for m in request.messages if m.role != "system"]
     
     if not messages:
         messages = [{"role": "user", "content": "Hello"}]
     
-    # Use Haiku for fast voice responses
-    model = "anthropic/claude-3-haiku-20240307"
-    
     try:
-        if request.stream:
-            stream_gen = await call_clawdbot(
-                messages=messages,
-                model=model,
-                max_tokens=request.max_tokens or 1024,
-                system=system,
-                stream=True
-            )
-            return StreamingResponse(stream_gen, media_type="text/event-stream")
-        else:
-            result = await call_clawdbot(
-                messages=messages,
-                model=model,
-                max_tokens=request.max_tokens or 1024,
-                system=system,
-                stream=False
-            )
-            return result
+        # First call to Haiku with tools
+        haiku_response = await call_haiku(messages, system, TOOLS)
+        
+        # Check if Haiku wants to use a tool
+        tool_calls = extract_tool_calls(haiku_response)
+        
+        if tool_calls:
+            # Process tool calls
+            tool_results = []
+            for tool_call in tool_calls:
+                if tool_call["function"]["name"] == "ask_sophie":
+                    args = json.loads(tool_call["function"]["arguments"])
+                    question = args.get("question", "")
+                    urgency = args.get("urgency", "normal")
+                    
+                    # Call Sophie
+                    sophie_response = await call_sophie(question, urgency)
+                    tool_results.append({
+                        "tool_call_id": tool_call["id"],
+                        "role": "tool",
+                        "content": sophie_response
+                    })
+            
+            # Continue conversation with tool results
+            messages.append(haiku_response["choices"][0]["message"])
+            messages.extend(tool_results)
+            
+            # Get Haiku's final response after seeing Sophie's answer
+            final_response = await call_haiku(messages, system)
+            return final_response
+        
+        # No tool use - return Haiku's direct response
+        return haiku_response
             
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Return error in OpenAI format
+        return {
+            "id": f"chatcmpl-error-{uuid.uuid4()}",
+            "object": "chat.completion",
+            "created": int(datetime.now().timestamp()),
+            "model": "claude-3-haiku-20240307",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": f"Sorry, I ran into a problem: {str(e)}"
+                },
+                "finish_reason": "stop"
+            }]
+        }
 
 
 @app.get("/health")
@@ -180,16 +295,21 @@ async def health():
 async def root():
     return {
         "service": "Sophie Voice Bridge",
-        "description": "OpenAI-compatible endpoint for ElevenLabs Custom LLM",
+        "description": "Haiku voice interface with Sophie (Opus) escalation",
         "endpoint": "/v1/chat/completions",
-        "docs": "/docs",
-        "backend": CLAWDBOT_GATEWAY_URL
+        "architecture": {
+            "fast_layer": "Claude 3 Haiku - handles quick responses",
+            "full_brain": "Claude Opus 4.5 (Sophie) - complex questions via ask_sophie tool"
+        },
+        "docs": "/docs"
     }
 
 
 if __name__ == "__main__":
     import uvicorn
-    print("🎙️ Sophie Voice Bridge starting on http://0.0.0.0:8013")
-    print(f"📡 Backend: {CLAWDBOT_GATEWAY_URL}")
-    print("📌 Point ElevenLabs Custom LLM to: http://<your-domain>:8013/v1/chat/completions")
+    print("🎙️ Sophie Voice Bridge")
+    print("   Fast layer: Haiku (1-3 sentence voice responses)")
+    print("   Full brain: Sophie/Opus via ask_sophie tool")
+    print(f"   Backend: {CLAWDBOT_GATEWAY_URL}")
+    print("   Endpoint: http://0.0.0.0:8013/v1/chat/completions")
     uvicorn.run(app, host="0.0.0.0", port=8013)
